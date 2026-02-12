@@ -27,7 +27,7 @@ inputs:
     default: "live"
 
   clone_content:
-    description: "If set to true, the database and files directory will be re-cloned from the source environment. When set to false, this data is only copied upon Multidev creations. Setting this variable to true ensures fresh content but adds time to the build process that can be prohibitive for sites with large databases."
+    description: "If set to true, the database and files directory will be re-cloned from the source environment. When set to false, this data is NOT copied during Multidev creation, and only re-cloned on existing environments if the flag is explicitly passed. Setting this variable to false ensures a faster build process."
     required: false
     default: false
     type: boolean
@@ -116,13 +116,16 @@ runs:
           set +e
           if [ "$CLONE_CONTENT" == "true" ]; then
             export CLONE_CONTENT_FLAG="--clone-content"
+            export MULTIDEV_CREATE_FLAGS=""
             echo "Content will be cloned again if the target environment already exists"
           else
             export CLONE_CONTENT_FLAG=""
-            echo "Content will NOT be cloned again if the target environment already exists"
+            export MULTIDEV_CREATE_FLAGS="--no-db --no-files"
+            echo "Content will NOT be cloned (clean creation for Multidevs)"
           fi
 
           echo "PANTHEON_CLONE_CONTENT_FLAG=${CLONE_CONTENT_FLAG}" >> $GITHUB_ENV
+          echo "PANTHEON_MULTIDEV_CREATE_FLAGS=${MULTIDEV_CREATE_FLAGS}" >> $GITHUB_ENV
 
       - name: Check required permissions
         shell: bash
@@ -388,6 +391,18 @@ runs:
             cd ${PANTHEON_REPO_DIR}
           fi
 
+          # Pre-creation step for Multidev environments
+          ENV_JUST_CREATED="false"
+          if [ "$PANTHEON_TARGET_ENV" != "dev" ]; then
+            if ! terminus multidev:list ${PANTHEON_SITE} --format=list | grep -q "^${PANTHEON_TARGET_ENV}$"; then
+              echo "Creating new multidev environment: ${PANTHEON_TARGET_ENV} with flags: ${PANTHEON_MULTIDEV_CREATE_FLAGS}"
+              terminus multidev:create ${PANTHEON_SITE}.${PANTHEON_SOURCE_ENV} ${PANTHEON_TARGET_ENV} --yes ${PANTHEON_MULTIDEV_CREATE_FLAGS}
+              ENV_JUST_CREATED="true"
+            else
+              echo "Multidev environment ${PANTHEON_TARGET_ENV} already exists."
+            fi
+          fi
+
           if [ "$SKIP_BUILD_TOOLS" == "true" ] || [ "$LIVE_ENV_EXISTS" == "false" ]; then
             SITE_ID=$(terminus site:info ${PANTHEON_SITE} --field=id)
 
@@ -398,13 +413,6 @@ runs:
             else
               PANTHEON_DESTINATION_BRANCH="${PANTHEON_TARGET_ENV}"
               echo "Target environment is ${PANTHEON_TARGET_ENV}, pushing to branch with the same name on Pantheon."
-              # Check if a multidev already exists for this PR.
-              if terminus multidev:list ${PANTHEON_SITE} --format=list | grep -q "^${PANTHEON_TARGET_ENV}$"; then
-                echo "Multidev environment ${PANTHEON_TARGET_ENV} already exists. Pushing code to existing environment."
-              else
-                echo "Creating new multidev environment: ${PANTHEON_TARGET_ENV}"
-                terminus multidev:create ${PANTHEON_SITE}.${PANTHEON_SOURCE_ENV} ${PANTHEON_TARGET_ENV} --yes
-              fi
             fi
 
             # Ensure repo is not shallow; Pantheon rejects shallow pushes
@@ -428,7 +436,14 @@ runs:
             exit 0
           fi
 
-          terminus -n build:env:create ${PANTHEON_SITE}.${PANTHEON_SOURCE_ENV} ${PANTHEON_TARGET_ENV} --yes --message="${PANTHEON_COMMIT_MESSAGE}" ${PANTHEON_CLONE_CONTENT_FLAG}
+          # For build:env:create, if we just created the environment, we don't need to pass the clone flag again
+          # because the initial creation already did it (unless flags like --no-db were used).
+          FINAL_CLONE_FLAG="${PANTHEON_CLONE_CONTENT_FLAG}"
+          if [ "$ENV_JUST_CREATED" == "true" ]; then
+            FINAL_CLONE_FLAG=""
+          fi
+
+          terminus -n build:env:create ${PANTHEON_SITE}.${PANTHEON_SOURCE_ENV} ${PANTHEON_TARGET_ENV} --yes --message="${PANTHEON_COMMIT_MESSAGE}" ${FINAL_CLONE_FLAG}
 
       - name: Update deployment status
         uses: bobheadxi/deployments@v1
